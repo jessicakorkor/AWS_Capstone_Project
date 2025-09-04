@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Translation service with Lambda, S3 buckets, and automatic file processing'
+
+Parameters:
+  Region:
+    Type: String
+    Default: us-east-1 # Change as needed
+    Description: AWS region for deployment
+  
+  RequestBucketName:
+    Type: String
+    Default: jessiek-requests-bucket # Change to a globally unique bucket name
+    Description: Name of the S3 bucket for incoming requests
+  
+  ResponseBucketName:
+    Type: String
+    Default: jessiek-responses-bucket # Change to a globally unique bucket name
+    Description: Name of the S3 bucket for translation responses
+  
+  LifecycleExpirationDays:
+    Type: Number
+    Default: 30
+    Description: Number of days after which objects expire
+  
+  DefaultTargetLang:
+    Type: String
+    Default: fr # Default target language code (e.g., 'fr' for French)
+    Description: Default target language for translation
+
+Resources:
+  # S3 Buckets
+  RequestBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref RequestBucketName
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-objects
+            Status: Enabled
+            ExpirationInDays: 30
+
+  ResponseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ResponseBucketName
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-objects
+            Status: Enabled
+            ExpirationInDays: !Ref LifecycleExpirationDays
+
+  # IAM Role for Lambda
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: jessiek-translate-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RequestBucket.Arn
+                  - !Sub "${RequestBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${ResponseBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - translate:TranslateText
+                  - comprehend:DetectDominantLanguage
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda Function
+  TranslateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: jessiek-translate-lambda-function
+      Role: !GetAtt LambdaRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      MemorySize: 256
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+
+          s3 = boto3.client('s3')
+          translate = boto3.client('translate')
+
+          RESPONSE_BUCKET = os.environ.get("RESPONSE_BUCKET", "habi-response-bucket")
+          DEFAULT_TARGET_LANG = os.environ.get("DEFAULT_TARGET_LANG", "fr")
+
+          def lambda_handler(event, context):
+              try:
+                  # 1. Get info about uploaded file
+                  request_bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = event['Records'][0]['s3']['object']['key']
+
+                  # 2. Read JSON file from request bucket
+                  response = s3.get_object(Bucket=request_bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  data = json.loads(content)
+
+                  # 3. Translate using AWS Translate
+                  word = data.get("word", "")
+                  target_lang = data.get("target_language", DEFAULT_TARGET_LANG)
+                  if word:
+                      translation = translate.translate_text(
+                          Text=word,
+                          SourceLanguageCode="auto",
+                          TargetLanguageCode=target_lang
+                      )
+                      translated_word = translation.get("TranslatedText", "")
+                  else:
+                      translated_word = ""
+
+                  result = {
+                      "original": word,
+                      "translated": translated_word
+                  }
+
+                  # 4. Save result into response bucket
+                  output_key = key.replace(".json", "_translated.json")
+
+                  s3.put_object(
+                      Bucket=RESPONSE_BUCKET,
+                      Key=output_key,
+                      Body=json.dumps(result),
+                      ContentType="application/json"
+                  )
+                  print(f"Processed {key} and saved result to {output_key} in {RESPONSE_BUCKET}")
+                  return {"status": "success", "output_file": output_key}
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {"status": "error", "message": str(e)}
+      Environment:
+        Variables:
+          RESPONSE_BUCKET: !Ref ResponseBucket
+          DEFAULT_TARGET_LANG: !Ref DefaultTargetLang
+
+  # Lambda Permission for S3
+  LambdaS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TranslateLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt RequestBucket.Arn
+
+  # S3 Bucket Notification Configuration
+  S3BucketNotification:
+    Type: Custom::S3BucketNotification
+    Properties:
+      ServiceToken: !GetAtt S3BucketNotificationFunction.Arn
+      Bucket: !Ref RequestBucket
+      LambdaFunction: !GetAtt TranslateLambda.Arn
+      Events:
+        - s3:ObjectCreated:*
+    DependsOn: LambdaS3Permission
+
+  # Lambda function to handle S3 bucket notification setup
+  S3BucketNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-s3-notification-setup"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt S3NotificationLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  request_type = event['RequestType']
+                  bucket = event['ResourceProperties']['Bucket']
+                  lambda_arn = event['ResourceProperties']['LambdaFunction']
+                  events = event['ResourceProperties']['Events']
+                  
+                  if request_type in ['Create', 'Update']:
+                      notification_config = {
+                          'LambdaFunctionConfigurations': [
+                              {
+                                  'Id': 'lambda-trigger',
+                                  'LambdaFunctionArn': lambda_arn,
+                                  'Events': events
+                              }
+                          ]
+                      }
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration=notification_config
+                      )
+                  elif request_type == 'Delete':
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={}
+                      )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM Role for S3 notification setup Lambda
+  S3NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !GetAtt RequestBucket.Arn
+
+Outputs:
+  RequestBucketName:
+    Description: Name of the request S3 bucket
+    Value: !Ref RequestBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-RequestBucket"
+  
+  ResponseBucketName:
+    Description: Name of the response S3 bucket  
+    Value: !Ref ResponseBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ResponseBucket"
+  
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt TranslateLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaArn"
